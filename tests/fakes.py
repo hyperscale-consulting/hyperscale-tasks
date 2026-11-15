@@ -31,6 +31,12 @@ class FakeSQS:
         return {"Successful": [], "Failed": []}
 
     def change_message_visibility(self, **kwargs: Any) -> dict[str, Any]:
+        # SQS's hard maximum: 12 hours (and less, counted from the receive).
+        if kwargs["VisibilityTimeout"] > 43200:
+            raise ClientError(
+                {"Error": {"Code": "InvalidParameterValue", "Message": "too long"}},
+                "ChangeMessageVisibility",
+            )
         self.visibility_changes.append(kwargs)
         return {}
 

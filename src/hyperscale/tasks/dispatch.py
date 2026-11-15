@@ -33,6 +33,10 @@ from hyperscale.tasks.retrying import MAX_RETRY_FOR
 logger = logging.getLogger(__name__)
 
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# SQS caps visibility at 12 h from the ReceiveMessage, and extending it does
+# not reset that clock; a longer VisibilityTimeout is an error. Leave room for
+# the longest Lambda run (900 s) plus a margin for the receive and invoke.
+MAX_VISIBILITY_SECONDS = 43200 - 900 - 60
 # TaskContext.attempt counts worker ids; SQS doesn't say which workers ran it.
 WORKER_ID = "sqs"
 
@@ -240,7 +244,7 @@ def _run(
     # carry the task's exception (and its message) as its context.
     fields["error"] = type(error).__name__
     exc_info = exc_info_without_messages(error)
-    delay = backoff_seconds(attempt)
+    delay = min(backoff_seconds(attempt), MAX_VISIBILITY_SECONDS)
     first_receive = int(record["attributes"]["ApproximateFirstReceiveTimestamp"])
     window_end = (
         EPOCH

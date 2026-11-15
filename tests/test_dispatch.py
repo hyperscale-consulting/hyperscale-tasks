@@ -176,6 +176,32 @@ def test_failure_past_window_gives_up_to_dlq(
     assert gave_up["exc_info"] is not None
 
 
+def test_long_backoff_is_capped_below_the_sqs_receive_limit(
+    fake_sqs: FakeSQS, caplog: pytest.LogCaptureFixture
+) -> None:
+    # backoff_seconds(7) is 12 h, which SQS rejects once any time has passed
+    # since the receive.
+    assert run(record(task_body("boom"), receive_count=7)) is False
+
+    assert [c["VisibilityTimeout"] for c in fake_sqs.visibility_changes] == [42240]
+    assert event(caplog, "tasks.retrying")["delay_seconds"] == 42240
+
+
+@pytest.mark.parametrize(
+    "retry_for_s,gives_up",
+    # Attempt 7 waits the capped 42240 s, not 43200 s: a window of exactly
+    # 42240 s still retries.
+    [(42240, False), (42239, True)],
+)
+def test_give_up_uses_the_capped_delay(
+    fake_sqs: FakeSQS, retry_for_s: int, gives_up: bool
+) -> None:
+    rec = record(task_body("boom") | {"retry_for_s": retry_for_s}, receive_count=7)
+
+    assert run(rec) is gives_up
+    assert len(fake_sqs.sent) == int(gives_up)
+
+
 @pytest.mark.parametrize(
     "seconds_ago,gives_up",
     # retry_for 600 s, attempt 1 backs off 30 s: the window ends at
