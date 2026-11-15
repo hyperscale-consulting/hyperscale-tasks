@@ -1,9 +1,6 @@
-import json
 import logging
 from collections.abc import Iterator
-from datetime import datetime
 from datetime import timedelta
-from datetime import UTC
 from typing import Any
 
 import pytest
@@ -13,12 +10,13 @@ from pytest_django.fixtures import Settings
 from hyperscale.tasks import dispatch
 from hyperscale.tasks.dispatch import process_record
 from tests.fakes import FakeSQS
+from tests.records import NOW
+from tests.records import record
 from tests.testapp import tasks
 from tests.testapp.management.commands import testcmd
 
 QUEUE = "https://sqs.example/q"
 DLQ = "https://sqs.example/dlq"
-NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
 ADDRESS = "secret@example.com"
 DELETED = {"QueueUrl": QUEUE, "ReceiptHandle": "rh-1"}
 ENVELOPE = {
@@ -42,23 +40,6 @@ def clean_calls() -> Iterator[None]:
 @pytest.fixture(autouse=True)
 def info_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="hyperscale.tasks.dispatch")
-
-
-def record(
-    body: object, receive_count: int = 1, first_receive: datetime = NOW
-) -> dict[str, Any]:
-    """One entry of a Lambda SQS event's `Records`."""
-    return {
-        "messageId": "msg-1",
-        "receiptHandle": "rh-1",
-        "body": body if isinstance(body, str) else json.dumps(body),
-        "attributes": {
-            "ApproximateReceiveCount": str(receive_count),
-            "ApproximateFirstReceiveTimestamp": str(
-                int(first_receive.timestamp() * 1000)
-            ),
-        },
-    }
 
 
 def task_body(name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
