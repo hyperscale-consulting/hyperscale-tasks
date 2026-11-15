@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError
+from django.conf import settings as django_settings
+from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 
 from hyperscale.tasks import lambda_handler
@@ -110,7 +112,7 @@ def test_sweep_closes_connections(monkeypatch: pytest.MonkeyPatch, fails: bool) 
     closed: list[None] = []
     swept: list[str] = []
 
-    def fake_sweep(queue_url: str) -> None:
+    def fake_sweep(queue_url: str, *, budget_seconds: float) -> None:
         swept.append(queue_url)
         if fails:
             raise RuntimeError("database went away")
@@ -197,11 +199,16 @@ def test_setup_failure_propagates_and_is_resurfaced(
     with pytest.raises(RuntimeError) as first:
         handler(event, None)
     assert first.value is original
-    with pytest.raises(RuntimeError, match="failed earlier") as second:
+    with pytest.raises(RuntimeError) as second:
         handler(event, None)
 
     # A failed populate() cannot be retried, so later invokes are not tried
-    # again; each raises a fresh error caused by the original.
+    # again; each raises a fresh error caused by the original. Lambda reports
+    # only str() of what the handler raised, so that names the original's
+    # class, though never its message.
+    assert str(second.value) == (
+        "django.setup() failed earlier in this environment: RuntimeError"
+    )
     assert second.value is not original
     assert second.value.__cause__ is original
     assert cold_start == ["secrets", "setup"]
@@ -241,6 +248,60 @@ assert second.__cause__ is first, repr(second.__cause__)
         [sys.executable, "-c", code], env=env, capture_output=True, text=True
     )
     assert done.returncode == 0, done.stderr
+
+
+class FakeContext:
+    def __init__(self, remaining_ms: int) -> None:
+        self.remaining_ms = remaining_ms
+
+    def get_remaining_time_in_millis(self) -> int:
+        return self.remaining_ms
+
+
+@pytest.mark.parametrize(
+    "context,budget",
+    [
+        pytest.param(None, 60, id="no_context"),
+        pytest.param(FakeContext(900_000), 60, id="long_timeout"),
+        pytest.param(FakeContext(30_000), 20, id="short_timeout"),
+    ],
+)
+def test_sweep_budget_leaves_room_before_the_lambda_timeout(
+    monkeypatch: pytest.MonkeyPatch, context: object, budget: float
+) -> None:
+    budgets: list[float] = []
+
+    def fake_sweep(queue_url: str, *, budget_seconds: float) -> None:
+        budgets.append(budget_seconds)
+
+    monkeypatch.setattr("hyperscale.tasks.sweep.sweep", fake_sweep)
+
+    handler({"v": 1, "kind": "sweep"}, context)
+
+    assert budgets == [budget]
+
+
+def test_pooled_connections_refuse_the_cold_start(
+    monkeypatch: pytest.MonkeyPatch, cold_start: list[str], fake_sqs: FakeSQS
+) -> None:
+    """hyperscale_tasks.E001 is enforced here: Lambda never runs system checks."""
+    monkeypatch.setenv("HYPERSCALE_RUNTIME", "lambda")
+    pooled = {"ENGINE": "django.db.backends.postgresql", "OPTIONS": {"pool": True}}
+    # Only what the check reads; the live test connection is left alone.
+    monkeypatch.setattr(django_settings, "DATABASES", {"default": pooled})
+    event = sqs_event(record(task_body("ok", 1)))
+
+    with pytest.raises(ImproperlyConfigured, match="hyperscale_tasks.E001") as first:
+        handler(event, None)
+    with pytest.raises(RuntimeError) as second:
+        handler(event, None)
+
+    # Remembered like any other django.setup() failure.
+    assert second.value.__cause__ is first.value
+    assert str(second.value).endswith(": ImproperlyConfigured")
+    assert cold_start == ["secrets", "setup"]
+    assert tasks.calls == []
+    assert fake_sqs.deleted == []
 
 
 def test_setup_runs_once_across_invocations(

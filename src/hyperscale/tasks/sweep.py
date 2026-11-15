@@ -32,10 +32,19 @@ class SweepResult:
     oldest_unsent_age_seconds: int
 
 
-def sweep(queue_url: str, now: datetime | None = None) -> SweepResult:
-    """Send unsent rows, delete old sent rows, and report how stale the outbox is."""
+def sweep(
+    queue_url: str,
+    now: datetime | None = None,
+    *,
+    budget_seconds: float = BUDGET_SECONDS,
+) -> SweepResult:
+    """Send unsent rows, delete old sent rows, and report how stale the outbox is.
+
+    Sending stops once `budget_seconds` have passed (the Lambda handler passes
+    less when its invocation has less time left); the next sweep carries on.
+    """
     now = now or timezone.now()
-    deadline = time.monotonic() + BUDGET_SECONDS
+    deadline = time.monotonic() + budget_seconds
     sent = 0
     failed: set[uuid.UUID] = set()  # tried this run; the next sweep retries them
 
