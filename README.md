@@ -54,7 +54,10 @@ Startup checks:
 - When `HYPERSCALE_RUNTIME` is `lambda`, the system check
   `hyperscale_tasks.E001` fails if a database has `"pool"` in `OPTIONS` or a
   non-zero `CONN_MAX_AGE`. Lambda freezes the environment between invocations,
-  so a held connection goes stale.
+  so a held connection goes stale. Lambda never runs system checks, so the
+  handler also enforces E001 at cold start: after `django.setup()` it raises
+  `ImproperlyConfigured` naming the error, and every later invoke in that
+  environment fails too, until Lambda replaces it.
 
 ## Writing tasks
 
@@ -77,7 +80,8 @@ Rules for task authors:
   duplicated.
 - **Pass ids, not objects or personal data.** Arguments must be
   JSON-serialisable and small: an SQS message is at most 256 KB. An
-  unserialisable argument fails at `enqueue`, before anything is written.
+  unserialisable argument (`TypeError`) or a message body over 262144 bytes
+  (`ValueError`) fails at `enqueue`, before anything is written.
 - **Keep a task's import path and argument shape valid for one release after
   you change them.** Messages enqueued by the old web release are consumed by
   the new worker.
@@ -127,6 +131,11 @@ visibility timeout and reach the DLQ through the queue's `maxReceiveCount`.
 - Non-default queues: a task with another `queue_name` is rejected with
   `InvalidTask`.
 - Async tasks.
+- Django's `task_enqueued`, `task_started` and `task_finished` signals: the
+  Lambda handler does not send them.
+- Retrying a task module that fails to import. The handler treats any import
+  failure, even a transient one, as a bad message: it goes to the DLQ as
+  `bad_message`, and needs a redrive once the cause is fixed.
 
 ## Event handlers
 
@@ -183,6 +192,21 @@ Events, all as `logging` records with `extra` fields: `tasks.started`,
 `delay_seconds`), `tasks.gave_up` (ERROR), `tasks.bad_message` (ERROR),
 `tasks.unhandled_event` (ERROR), `tasks.send_deferred` (WARNING) and
 `tasks.outbox_swept`. Task events carry `task`, `attempt` and `message_id`.
+The events are logged to the `hyperscale.tasks` logger and its children.
+
+The app's `LOGGING` must route the `hyperscale.tasks` logger, at INFO, to its
+JSON handler on stdout. The `jobs-outbox` alarm reads the INFO
+`tasks.outbox_swept` line, and `jobs-errors` reads the ERROR lines; neither
+fires if the lines are dropped. For example, with a handler named `json`:
+
+```python
+LOGGING = {
+    # ...
+    "loggers": {
+        "hyperscale.tasks": {"handlers": ["json"], "level": "INFO"},
+    },
+}
+```
 
 Logs never include exception messages or task arguments: errors log the class
 name, and tracebacks are logged with their frames and class names but with
@@ -194,8 +218,9 @@ still see arguments, so configure it not to.
 
 `ImmediateBackend` runs a task as soon as it is enqueued, in the same process,
 like Django's own immediate backend, and accepts `retry_for`. It accepts
-`run_after` but ignores the delay and runs the task at once. Use it for
-development and tests only.
+`run_after` but ignores the delay and runs the task at once. Like
+`SQSOutboxBackend`, it rejects async tasks and a non-default `priority` with
+`InvalidTask`, so tests catch them. Use it for development and tests only.
 
 ```python
 TASKS = {"default": {"BACKEND": "hyperscale.tasks.backend.ImmediateBackend"}}
