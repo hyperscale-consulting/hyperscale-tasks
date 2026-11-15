@@ -1,13 +1,9 @@
-import json
 import logging
-import uuid
 from collections.abc import Sequence
 from datetime import timedelta
 from functools import partial
 from typing import Any
 
-from botocore.exceptions import BotoCoreError
-from botocore.exceptions import ClientError
 from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.tasks import DEFAULT_TASK_QUEUE_NAME
@@ -33,6 +29,9 @@ class ImmediateBackend(_ImmediateBackend):
 
     # run_after is accepted, though this backend still runs tasks at once.
     supports_defer = True
+    # Refuse what SQSOutboxBackend refuses, so tests catch it before production.
+    supports_priority = False
+    supports_async_task = False
     task_class = RetryingTask
 
 
@@ -66,18 +65,24 @@ class SQSOutboxBackend(BaseTaskBackend):
         kwargs: dict[str, Any],
     ) -> TaskResult[..., Any]:
         self.validate_task(task)
-        # Fail on unserialisable arguments before anything is written.
-        json.dumps(args)
-        json.dumps(kwargs)
         retry_for: timedelta = getattr(task, "retry_for", DEFAULT_RETRY_FOR)
-        row = OutboxMessage.objects.create(
+        row = OutboxMessage(
             task_path=task.module_path,
             args=list(args),
             kwargs=kwargs,
             run_after=task.run_after,
             retry_for_seconds=int(retry_for.total_seconds()),
         )
-        transaction.on_commit(partial(self._send_if_due, row.id))
+        # Before anything is written: an unserialisable argument raises
+        # TypeError here, and an oversize body would fail every send.
+        size = len(sqs.body_for(row).encode())
+        if size > sqs.MAX_BODY_BYTES:
+            raise ValueError(
+                f"The task's message body is {size} bytes; SQS takes at most "
+                f"{sqs.MAX_BODY_BYTES}. Pass ids, not data."
+            )
+        row.save(force_insert=True)
+        transaction.on_commit(partial(self._send_if_due, row))
         return TaskResult(
             task=task,
             id=str(row.id),
@@ -93,17 +98,20 @@ class SQSOutboxBackend(BaseTaskBackend):
             worker_ids=[],
         )
 
-    def _send_if_due(self, row_id: uuid.UUID) -> None:
-        """Send after commit. Never raises: the sweep picks up what fails here."""
+    def _send_if_due(self, row: OutboxMessage) -> None:
+        """Send after commit. Never raises: the sweep picks up what fails here.
+
+        An exception escaping an on_commit hook would fail the committed
+        request and skip the hooks registered after this one.
+        """
         now = timezone.now()
+        if row.run_after is not None and row.run_after > now + MAX_DELAY:
+            return
         try:
-            row = OutboxMessage.objects.get(id=row_id, sent_at__isnull=True)
-            if row.run_after is not None and row.run_after > now + MAX_DELAY:
-                return
             sqs.send_row(row, self.queue_url, now)
-        except (BotoCoreError, ClientError) as exc:
+        except Exception as exc:
             # Class name only: the message can carry personal data.
             logger.warning(
                 "tasks.send_deferred",
-                extra={"outbox_id": str(row_id), "error": type(exc).__name__},
+                extra={"outbox_id": str(row.id), "error": type(exc).__name__},
             )

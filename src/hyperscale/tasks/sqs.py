@@ -4,6 +4,7 @@ from functools import cache
 from typing import TYPE_CHECKING
 
 import boto3
+from botocore.config import Config
 
 from hyperscale.tasks.models import OutboxMessage
 
@@ -12,12 +13,27 @@ if TYPE_CHECKING:
 
 # SQS refuses a DelaySeconds above 15 minutes.
 MAX_DELAY_SECONDS = 900
+# The largest message body sent: 256 KB, the SQS message size limit.
+MAX_BODY_BYTES = 262144
+
+# Fail fast: a send runs in the request after commit and in the sweep while it
+# holds row locks, and the sweep sends whatever fails here.
+CLIENT_CONFIG = Config(
+    connect_timeout=2,
+    read_timeout=5,
+    retries={"mode": "standard", "max_attempts": 2},
+)
 
 
 @cache
 def client() -> SQSClient:
     """The one place a boto3 SQS client is made; tests replace this."""
-    return boto3.client("sqs")  # pyright: ignore[reportUnknownMemberType]
+    # Its own session, so app code that reconfigures boto3's shared default
+    # session cannot change this client's timeouts or retries.
+    session = boto3.session.Session()
+    # The stubs type only the services installed (sqs); the other overloads
+    # are unknown.
+    return session.client("sqs", config=CLIENT_CONFIG)  # pyright: ignore[reportUnknownMemberType]
 
 
 def body_for(row: OutboxMessage) -> str:

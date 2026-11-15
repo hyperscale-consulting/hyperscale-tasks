@@ -1,15 +1,22 @@
 import json
+import uuid
 from datetime import timedelta
 from typing import Any
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
+from django.db import DatabaseError
 from django.db import transaction
 from django.tasks.exceptions import InvalidTask
 from django.utils import timezone
 
+from hyperscale.tasks import sqs
 from hyperscale.tasks.models import OutboxMessage
 from tests.fakes import FakeSQS
 from tests.testapp.tasks import notify
+from tests.testapp.tasks import ok
+
+ADDRESS = "secret@example.com"
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -101,5 +108,82 @@ def test_queue_url_is_required(settings: Any) -> None:
     settings.TASKS = {
         "default": {"BACKEND": "hyperscale.tasks.backend.SQSOutboxBackend"}
     }
-    with pytest.raises(Exception, match="QUEUE_URL"):
+    with pytest.raises(ImproperlyConfigured, match="QUEUE_URL"):
         notify.enqueue(1)
+
+
+def broken_send(*args: object, **kwargs: object) -> None:
+    raise DatabaseError(ADDRESS)
+
+
+def test_any_send_error_is_deferred_and_later_hooks_still_run(
+    fake_sqs: FakeSQS,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(sqs, "send_row", broken_send)
+    later: list[str] = []
+
+    with transaction.atomic():
+        notify.enqueue(42)  # its hook raises after commit
+        transaction.on_commit(lambda: later.append("ran"))
+
+    assert later == ["ran"]
+    row = OutboxMessage.objects.get()
+    assert row.sent_at is None
+    [deferred] = [r for r in caplog.records if r.getMessage() == "tasks.send_deferred"]
+    assert vars(deferred)["outbox_id"] == str(row.id)
+    assert vars(deferred)["error"] == "DatabaseError"
+    assert ADDRESS not in caplog.text
+
+
+def test_any_send_error_in_autocommit_does_not_raise(
+    fake_sqs: FakeSQS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sqs, "send_row", broken_send)
+
+    result = notify.enqueue(42)
+
+    assert OutboxMessage.objects.get().id == uuid.UUID(result.id)
+
+
+def test_send_after_commit_does_not_read_the_row_back(
+    fake_sqs: FakeSQS, django_assert_num_queries: Any
+) -> None:
+    with django_assert_num_queries(2):  # the INSERT, then the UPDATE of sent_at
+        notify.enqueue(7)
+
+    assert len(fake_sqs.sent) == 1
+
+
+def body_bytes_with_label(label: str) -> int:
+    """The encoded body size of `ok.enqueue(1, label=label)`."""
+    row = OutboxMessage(
+        task_path="tests.testapp.tasks.ok",
+        args=[1],
+        kwargs={"label": label},
+        retry_for_seconds=86400,
+    )
+    return len(sqs.body_for(row).encode())
+
+
+def test_body_at_the_size_limit_is_enqueued(fake_sqs: FakeSQS) -> None:
+    label = "x" * (sqs.MAX_BODY_BYTES - body_bytes_with_label(""))
+
+    ok.enqueue(1, label=label)
+
+    assert len(fake_sqs.sent[0]["MessageBody"].encode()) == sqs.MAX_BODY_BYTES
+    assert OutboxMessage.objects.get().sent_at is not None
+
+
+def test_body_over_the_size_limit_is_refused_before_writing(
+    fake_sqs: FakeSQS,
+) -> None:
+    label = "x" * (sqs.MAX_BODY_BYTES - body_bytes_with_label("") + 1)
+
+    with pytest.raises(ValueError, match=str(sqs.MAX_BODY_BYTES)) as raised:
+        ok.enqueue(1, label=label)
+
+    assert label not in str(raised.value)
+    assert not OutboxMessage.objects.exists()
+    assert fake_sqs.sent == []
