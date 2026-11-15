@@ -21,7 +21,6 @@ from django.tasks import Task
 from django.tasks import TaskContext
 from django.tasks import TaskResult
 from django.tasks import TaskResultStatus
-from django.utils import timezone
 from django.utils.module_loading import import_string
 
 from hyperscale.tasks import sqs
@@ -72,11 +71,13 @@ def process_record(
     and belongs in `batchItemFailures`. SQS errors propagate: the invocation
     fails and SQS redelivers, so a message is never deleted unless it reached
     the DLQ.
+
+    `now` is for tests; without it, each decision reads the clock when it is
+    made, so the give-up decision counts the time the task ran.
     """
-    now = now or timezone.now()
     try:
         attempt = int(record["attributes"]["ApproximateReceiveCount"])
-        job = _resolve(record, attempt, now)
+        job = _resolve(record, attempt, now or _now())
         if isinstance(job, str):
             logger.error(
                 "tasks.bad_message",
@@ -96,6 +97,11 @@ def process_record(
         connections.close_all()
 
 
+def _now() -> datetime:
+    # Aware even under USE_TZ = False, to compare with the SQS timestamps.
+    return datetime.now(UTC)
+
+
 def _resolve(
     record: dict[str, Any], attempt: int, now: datetime
 ) -> _Job | _Unhandled | str:
@@ -103,7 +109,8 @@ def _resolve(
     try:
         try:
             parsed = json.loads(record["body"])
-        except ValueError:
+        # RecursionError: a deeply nested body.
+        except ValueError, RecursionError:
             raise _BadMessage("not_json") from None
         if not isinstance(parsed, dict):
             raise _BadMessage("not_object")
@@ -225,7 +232,7 @@ def _run(
     attempt: int,
     queue_url: str,
     dlq_url: str,
-    now: datetime,
+    now: datetime | None,
 ) -> bool:
     fields = {"task": job.name, "attempt": attempt, "message_id": record["messageId"]}
     logger.info("tasks.started", extra=fields)
@@ -251,7 +258,7 @@ def _run(
         + timedelta(milliseconds=first_receive)
         + min(job.retry_for, MAX_RETRY_FOR)
     )
-    if now + timedelta(seconds=delay) > window_end:
+    if (now or _now()) + timedelta(seconds=delay) > window_end:
         logger.error("tasks.gave_up", exc_info=exc_info, extra=fields)
         _move_to_dlq(record, queue_url, dlq_url, "gave_up")
         return True

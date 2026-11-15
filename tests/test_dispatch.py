@@ -1,6 +1,8 @@
 import logging
 from collections.abc import Iterator
+from datetime import datetime
 from datetime import timedelta
+from datetime import UTC
 from typing import Any
 
 import pytest
@@ -472,3 +474,40 @@ def test_exception_groups_are_stripped_too() -> None:
     assert ADDRESS not in rendered
     assert ", in fail\n" in rendered
     assert rendered.endswith("ExceptionGroup")
+
+
+def test_deeply_nested_body_is_bad_message(
+    fake_sqs: FakeSQS, caplog: pytest.LogCaptureFixture
+) -> None:
+    body = "[" * 200000  # json.loads raises RecursionError, not ValueError
+
+    assert run(record(body)) is True
+
+    assert event(caplog, "tasks.bad_message")["reason"] == "not_json"
+    assert fake_sqs.sent == [to_dlq(body, "bad_message")]
+    assert fake_sqs.deleted == [DELETED]
+
+
+def test_handled_failure_without_use_tz(fake_sqs: FakeSQS, settings: Settings) -> None:
+    settings.USE_TZ = False
+    a_minute_ago = datetime.now(UTC) - timedelta(minutes=1)
+
+    rec = record(task_body("boom"), 1, a_minute_ago)
+
+    assert process_record(rec, QUEUE, DLQ) is False  # `now` not injected
+    assert [c["VisibilityTimeout"] for c in fake_sqs.visibility_changes] == [30]
+
+
+def test_give_up_decision_uses_the_time_after_the_task_ran(
+    fake_sqs: FakeSQS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fragile retries for 6 h. Received 5h55m before it started, its 30 s
+    # backoff still fits; but it ran for 10 minutes, and then it does not.
+    clock = iter([NOW, NOW + timedelta(minutes=10)])
+    monkeypatch.setattr(dispatch, "_now", lambda: next(clock))
+    rec = record(task_body("fragile"), 1, NOW - timedelta(hours=5, minutes=55))
+
+    assert process_record(rec, QUEUE, DLQ) is True  # gave up
+
+    assert fake_sqs.sent == [to_dlq(rec["body"], "gave_up")]
+    assert fake_sqs.visibility_changes == []
