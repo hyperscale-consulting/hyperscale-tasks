@@ -34,6 +34,7 @@ def cold_start(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
         calls.append("secrets")
 
     monkeypatch.setattr(lambda_handler, "_ready", False)
+    monkeypatch.setattr(lambda_handler, "_setup_error", None)
     monkeypatch.setattr(lambda_handler, "load_secrets", load_secrets)
     monkeypatch.setattr("django.setup", lambda: calls.append("setup"))
     monkeypatch.setenv("JOBS_QUEUE_URL", QUEUE)
@@ -152,40 +153,94 @@ def test_unknown_event_shape_raises(event: Any, fake_sqs: FakeSQS) -> None:
     assert fake_sqs.deleted == []
 
 
-@pytest.mark.parametrize("failing_step", ["secrets", "setup"])
-def test_setup_failure_propagates(
-    monkeypatch: pytest.MonkeyPatch, fake_sqs: FakeSQS, failing_step: str
+def test_secrets_failure_propagates_and_is_retried(
+    monkeypatch: pytest.MonkeyPatch, cold_start: list[str], fake_sqs: FakeSQS
 ) -> None:
-    calls: list[str] = []
-    failing = {failing_step}
-
-    def step(name: str) -> None:
-        calls.append(name)
-        if name in failing:
-            raise RuntimeError(f"{name} failed")
+    failing = [True]
 
     def load_secrets(environ: object) -> None:
-        step("secrets")
+        cold_start.append("secrets")
+        if failing:
+            raise RuntimeError("secrets failed")
 
     monkeypatch.setattr(lambda_handler, "load_secrets", load_secrets)
-    monkeypatch.setattr("django.setup", lambda: step("setup"))
     event = sqs_event(record(task_body("ok", 1)))
 
-    with pytest.raises(RuntimeError, match=f"{failing_step} failed"):
+    with pytest.raises(RuntimeError, match="secrets failed"):
         handler(event, None)
 
     # Secrets come first: settings may read them. Nothing ran and nothing was
     # settled, so the message comes back.
-    assert (
-        calls == {"secrets": ["secrets"], "setup": ["secrets", "setup"]}[failing_step]
-    )
+    assert cold_start == ["secrets"]
     assert tasks.calls == []
     assert fake_sqs.deleted == []
-    # Not marked ready, so the next invoke tries the whole cold start again.
+    # Secrets run before the app registry is touched, so the next invoke can
+    # try the whole cold start again.
     failing.clear()
-    calls.clear()
+    cold_start.clear()
     assert handler(event, None) == {"batchItemFailures": []}
-    assert calls == ["secrets", "setup"]
+    assert cold_start == ["secrets", "setup"]
+
+
+def test_setup_failure_propagates_and_is_resurfaced(
+    monkeypatch: pytest.MonkeyPatch, cold_start: list[str], fake_sqs: FakeSQS
+) -> None:
+    original = RuntimeError("setup failed")
+
+    def setup() -> None:
+        cold_start.append("setup")
+        raise original
+
+    monkeypatch.setattr("django.setup", setup)
+    event = sqs_event(record(task_body("ok", 1)))
+
+    with pytest.raises(RuntimeError) as first:
+        handler(event, None)
+    assert first.value is original
+    with pytest.raises(RuntimeError, match="failed earlier") as second:
+        handler(event, None)
+
+    # A failed populate() cannot be retried, so later invokes are not tried
+    # again; each raises a fresh error caused by the original.
+    assert second.value is not original
+    assert second.value.__cause__ is original
+    assert cold_start == ["secrets", "setup"]
+    assert tasks.calls == []
+    assert fake_sqs.deleted == []
+
+
+def test_real_setup_failure_names_the_cause_on_every_invoke() -> None:
+    """With Django's real populate(), which cannot be re-entered after a failure."""
+    env = {k: v for k, v in os.environ.items() if k != "DJANGO_SETTINGS_MODULE"}
+    code = """
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from hyperscale.tasks.lambda_handler import handler
+
+settings.configure(
+    DEBUG=False,
+    INSTALLED_APPS=["hyperscale.tasks"],
+    TASKS={"default": {
+        "BACKEND": "hyperscale.tasks.backend.SQSOutboxBackend",
+        "OPTIONS": {"QUEUE_URL": ""},
+    }},
+)
+errors = []
+for _ in range(2):
+    try:
+        handler({"Records": []}, None)
+    except Exception as exc:
+        errors.append(exc)
+first, second = errors
+assert isinstance(first, ImproperlyConfigured), repr(first)
+assert isinstance(second, RuntimeError), repr(second)
+assert second.__cause__ is first, repr(second.__cause__)
+"""
+
+    done = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stderr
 
 
 def test_setup_runs_once_across_invocations(

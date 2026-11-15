@@ -14,9 +14,12 @@ from django.db import connections
 
 from hyperscale.tasks.secrets import load_secrets
 
-# Set only once the whole cold start has succeeded, so a failed one is
-# retried on the next invoke instead of leaving a half-set-up process.
+# Set only once the whole cold start has succeeded. A secrets failure is
+# retried on the next invoke; a django.setup() failure cannot be (Django's
+# populate() is not re-entrant after it raises), so it is kept and named as the
+# cause on every later invoke in this environment.
 _ready = False
+_setup_error: BaseException | None = None
 
 
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
@@ -31,11 +34,21 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
 
 
 def _setup() -> None:
-    global _ready
+    global _ready, _setup_error
     if _ready:
         return
+    if _setup_error is not None:
+        # A fresh exception each time: re-raising the original would grow
+        # its traceback on every invoke.
+        raise RuntimeError(
+            "django.setup() failed earlier in this environment"
+        ) from _setup_error
     load_secrets(os.environ)  # first: settings may read the secrets
-    django.setup()
+    try:
+        django.setup()
+    except BaseException as exc:
+        _setup_error = exc
+        raise
     _ready = True
 
 
