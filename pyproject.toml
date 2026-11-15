@@ -1,0 +1,81 @@
+[project]
+name = "hyperscale-tasks"
+version = "0.1.0"
+description = "A Django tasks backend on a transactional outbox and SQS, with an AWS Lambda handler"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andy Caine", email = "andy@hyperscale.consulting" }]
+keywords = ["django", "tasks", "sqs", "outbox", "lambda"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 6.1",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "awslambdaric>=3",
+    "boto3>=1.40",
+    "django>=6.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/hyperscale-consulting/hyperscale-tasks"
+Repository = "https://github.com/hyperscale-consulting/hyperscale-tasks"
+Changelog = "https://github.com/hyperscale-consulting/hyperscale-tasks/blob/main/CHANGELOG.md"
+Issues = "https://github.com/hyperscale-consulting/hyperscale-tasks/issues"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "hyperscale.tasks"
+
+[tool.ruff]
+fix = true
+show-fixes = true
+output-format = "full"
+
+[tool.ruff.lint]
+select = [
+    "B",   # flake8-bugbear
+    "E",   # pycodestyle error
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "W",   # pycodestyle warning
+]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+order-by-type = false
+
+[tool.pyright]
+pythonVersion = "3.14"  # minimum supported version
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[secretsmanager,sqs]>=1.40",
+    "django-stubs>=6.1.1",
+    "pre-commit>=4.6.2",
+    "psycopg[binary]>=3.3.6",
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-django>=4.14.0",
+    "ruff>=0.16.8",
+]
