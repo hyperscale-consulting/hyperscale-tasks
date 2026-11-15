@@ -7,3 +7,8 @@ from django.tasks import task
 @task(retry_for=timedelta(hours=6))  # pyright: ignore[reportCallIssue, reportUntypedFunctionDecorator]
 def slow_partner() -> None:
     """A task that declares its own retry window."""
+
+
+@task
+def notify(user_id: int) -> None:  # pyright: ignore[reportUnusedFunction]
+    """A plain task taking one argument."""
