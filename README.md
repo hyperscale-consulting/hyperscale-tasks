@@ -182,7 +182,7 @@ it reached the DLQ.
 | `JOBS_QUEUE_URL` | web, migrations, schedules, Lambda | URL of the main queue |
 | `JOBS_DLQ_URL` | Lambda | URL of the DLQ |
 | `HYPERSCALE_RUNTIME` | web, migrations, schedules: `ecs`; Lambda: `lambda` | |
-| `HYPERSCALE_SECRETS_MAP` | Lambda | JSON: `{"<ENV NAME>": {"arn": "<secret arn>", "field": "<json key>" \| null}}`. A `null` field means the whole `SecretString`. |
+| `HYPERSCALE_SECRETS_MAP` | Lambda | JSON grouped by secret, so each ARN appears once: `{"<secret arn>": {"<ENV NAME>": "<json key>" \| null}}`. A `null` field means the whole `SecretString`. A variable may appear under only one ARN. |
 | `DJANGO_SETTINGS_MODULE` | Lambda | the app's settings module |
 
 ### Logging

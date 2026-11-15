@@ -24,6 +24,11 @@ def _client() -> SecretsManagerClient:
 
 
 def _parse_map(raw: str) -> dict[str, tuple[str, str | None]]:
+    """Parse ``{"<secret arn>": {"<ENV NAME>": "<json key>" | null}}``.
+
+    Returns ``{name: (arn, field)}`` in map order. A name may appear under
+    only one ARN.
+    """
     try:
         data: Any = json.loads(raw)
     except ValueError:
@@ -31,15 +36,17 @@ def _parse_map(raw: str) -> dict[str, tuple[str, str | None]]:
     if not isinstance(data, dict):
         raise ValueError(f"{MAP_VAR} must be a JSON object")
     parsed: dict[str, tuple[str, str | None]] = {}
-    for name, entry in data.items():  # pyright: ignore[reportUnknownVariableType]
+    for arn, entry in cast("dict[str, Any]", data).items():
         if not isinstance(entry, dict):
-            raise ValueError(f"{MAP_VAR} entry for {name} must be an object")
-        fields = cast("dict[str, Any]", entry)
-        arn = fields.get("arn")
-        field = fields.get("field")
-        if not isinstance(arn, str) or not (field is None or isinstance(field, str)):
-            raise ValueError(f"{MAP_VAR} entry for {name} needs a string arn and field")
-        parsed[str(name)] = (arn, field)  # pyright: ignore[reportUnknownArgumentType]
+            raise ValueError(f"{MAP_VAR} entry for {arn} must be an object")
+        for name, field in cast("dict[str, Any]", entry).items():
+            if not (field is None or isinstance(field, str)):
+                raise ValueError(
+                    f"{MAP_VAR} field for {name} under {arn} must be a string or null"
+                )
+            if name in parsed:
+                raise ValueError(f"{MAP_VAR} lists {name} under more than one ARN")
+            parsed[name] = (arn, field)
     return parsed
 
 
